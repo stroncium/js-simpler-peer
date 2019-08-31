@@ -34,7 +34,7 @@ function SimplerPeer (opts) {
     allowHalfOpen: false
   }, opts)
 
-  stream.Duplex.call(self, opts)
+  // stream.Duplex.call(self, opts)
 
   self.channelName = opts.initiator
     ? opts.channelName || randombytes(20).toString('hex')
