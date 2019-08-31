@@ -26,7 +26,6 @@ var CHANNEL_CLOSING_TIMEOUT = 5 * 1000
  */
 function SimplerPeer (opts) {
   var self = this
-  if (!(self instanceof Peer)) return new Peer(opts)
 
   self._id = randombytes(4).toString('hex').slice(0, 7)
   self._debug('new peer %o', opts)
