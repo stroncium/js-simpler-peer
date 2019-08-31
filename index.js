@@ -1,3 +1,5 @@
+const Emittery = require('emittery');
+
 module.exports = SimplerPeer
 
 const getBrowserRTC = function getBrowserRTC () {
@@ -153,6 +155,8 @@ function SimplerPeer (opts) {
   }
   self.once('finish', self._onFinishBound)
 }
+
+Emittery.mixin('emittery')(SimplerPeer);
 
 SimplerPeer.WEBRTC_SUPPORT = !!getBrowserRTC()
 
