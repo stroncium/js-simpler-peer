@@ -1,6 +1,141 @@
 const Emittery = require('emittery');
 
-module.exports = SimplerPeer
+var MAX_BUFFERED_AMOUNT = 64 * 1024
+var ICECOMPLETE_TIMEOUT = 5 * 1000
+var CHANNEL_CLOSING_TIMEOUT = 5 * 1000
+
+class SimplerPeer extends Emittery {
+  constructor(opts) {
+    super();
+    var self = this
+
+    // self._id = randombytes(4).toString('hex').slice(0, 7)
+    self._debug('new peer %o', opts)
+
+    opts = Object.assign({
+      allowHalfOpen: false
+    }, opts)
+
+    // stream.Duplex.call(self, opts)
+
+    self.channelName = opts.initiator
+      ? opts.channelName || `${Math.random()}${Math.random()}${Math.random()}`
+      : null
+
+    self.initiator = opts.initiator || false
+    self.channelConfig = opts.channelConfig || SimplerPeer.channelConfig
+    self.config = Object.assign({}, SimplerPeer.config, opts.config)
+    self.offerOptions = opts.offerOptions || {}
+    self.answerOptions = opts.answerOptions || {}
+    self.sdpTransform = opts.sdpTransform || function (sdp) { return sdp }
+    self.streams = opts.streams || (opts.stream ? [opts.stream] : []) // support old "stream" option
+    self.trickle = opts.trickle !== undefined ? opts.trickle : true
+    self.allowHalfTrickle = opts.allowHalfTrickle !== undefined ? opts.allowHalfTrickle : false
+    self.iceCompleteTimeout = opts.iceCompleteTimeout || ICECOMPLETE_TIMEOUT
+
+    self.destroyed = false
+    self._connected = false
+
+    self.remoteAddress = undefined
+    self.remoteFamily = undefined
+    self.remotePort = undefined
+    self.localAddress = undefined
+    self.localFamily = undefined
+    self.localPort = undefined
+
+    self._wrtc = (opts.wrtc && typeof opts.wrtc === 'object')
+      ? opts.wrtc
+      : getBrowserRTC()
+
+    if (!self._wrtc) {
+      if (typeof window === 'undefined') {
+        throw makeError('No WebRTC support: Specify `opts.wrtc` option in this environment', 'ERR_WEBRTC_SUPPORT')
+      } else {
+        throw makeError('No WebRTC support: Not a supported browser', 'ERR_WEBRTC_SUPPORT')
+      }
+    }
+
+    self._pcReady = false
+    self._channelReady = false
+    self._iceComplete = false // ice candidate trickle done (got null candidate)
+    self._iceCompleteTimer = null // send an offer/answer anyway after some timeout
+    self._channel = null
+    self._pendingCandidates = []
+
+    self._isNegotiating = !self.initiator // is this peer waiting for negotiation to complete?
+    self._batchedNegotiation = false // batch synchronous negotiations
+    self._queuedNegotiation = false // is there a queued negotiation request?
+    self._sendersAwaitingStable = []
+    self._senderMap = new Map()
+    self._firstStable = true
+    self._closingInterval = null
+
+    self._remoteTracks = []
+    self._remoteStreams = []
+
+    self._chunk = null
+    self._cb = null
+    self._interval = null
+
+    try {
+      self._pc = new (self._wrtc.RTCPeerConnection)(self.config)
+    } catch (err) {
+      setTimeout(() => self.destroy(makeError(err, 'ERR_PC_CONSTRUCTOR')), 0)
+      return
+    }
+
+    // We prefer feature detection whenever possible, but sometimes that's not
+    // possible for certain implementations.
+    self._isReactNativeWebrtc = typeof self._pc._peerConnectionId === 'number'
+
+    self._pc.oniceconnectionstatechange = function () {
+      self._onIceStateChange()
+    }
+    self._pc.onicegatheringstatechange = function () {
+      self._onIceStateChange()
+    }
+    self._pc.onsignalingstatechange = function () {
+      self._onSignalingStateChange()
+    }
+    self._pc.onicecandidate = function (event) {
+      self._onIceCandidate(event)
+    }
+
+    // Other spec events, unused by this implementation:
+    // - onconnectionstatechange
+    // - onicecandidateerror
+    // - onfingerprintfailure
+    // - onnegotiationneeded
+
+    if (self.initiator) {
+      self._setupData({
+        channel: self._pc.createDataChannel(self.channelName, self.channelConfig)
+      })
+    } else {
+      self._pc.ondatachannel = function (event) {
+        self._setupData(event)
+      }
+    }
+
+    if (self.streams) {
+      self.streams.forEach(function (stream) {
+        self.addStream(stream)
+      })
+    }
+    self._pc.ontrack = function (event) {
+      self._onTrack(event)
+    }
+
+    if (self.initiator) {
+      self._needsNegotiation()
+    }
+
+    self._onFinishBound = function () {
+      self._onFinish()
+    }
+    self.once('finish', self._onFinishBound)
+  }
+}
 
 const getBrowserRTC = function getBrowserRTC () {
   if (typeof window === 'undefined') return null
@@ -15,148 +150,6 @@ const getBrowserRTC = function getBrowserRTC () {
   if (!wrtc.RTCPeerConnection) return null
   return wrtc
 }
-
-var MAX_BUFFERED_AMOUNT = 64 * 1024
-var ICECOMPLETE_TIMEOUT = 5 * 1000
-var CHANNEL_CLOSING_TIMEOUT = 5 * 1000
-
-
-/**
- * WebRTC peer connection. Same API as node core `net.Socket`, plus a few extra methods.
- * Duplex stream.
- * @param {Object} opts
- */
-function SimplerPeer (opts) {
-  var self = this
-
-  // self._id = randombytes(4).toString('hex').slice(0, 7)
-  self._debug('new peer %o', opts)
-
-  opts = Object.assign({
-    allowHalfOpen: false
-  }, opts)
-
-  // stream.Duplex.call(self, opts)
-
-  self.channelName = opts.initiator
-    ? opts.channelName || `${Math.random()}${Math.random()}${Math.random()}`
-    : null
-
-  self.initiator = opts.initiator || false
-  self.channelConfig = opts.channelConfig || SimplerPeer.channelConfig
-  self.config = Object.assign({}, SimplerPeer.config, opts.config)
-  self.offerOptions = opts.offerOptions || {}
-  self.answerOptions = opts.answerOptions || {}
-  self.sdpTransform = opts.sdpTransform || function (sdp) { return sdp }
-  self.streams = opts.streams || (opts.stream ? [opts.stream] : []) // support old "stream" option
-  self.trickle = opts.trickle !== undefined ? opts.trickle : true
-  self.allowHalfTrickle = opts.allowHalfTrickle !== undefined ? opts.allowHalfTrickle : false
-  self.iceCompleteTimeout = opts.iceCompleteTimeout || ICECOMPLETE_TIMEOUT
-
-  self.destroyed = false
-  self._connected = false
-
-  self.remoteAddress = undefined
-  self.remoteFamily = undefined
-  self.remotePort = undefined
-  self.localAddress = undefined
-  self.localFamily = undefined
-  self.localPort = undefined
-
-  self._wrtc = (opts.wrtc && typeof opts.wrtc === 'object')
-    ? opts.wrtc
-    : getBrowserRTC()
-
-  if (!self._wrtc) {
-    if (typeof window === 'undefined') {
-      throw makeError('No WebRTC support: Specify `opts.wrtc` option in this environment', 'ERR_WEBRTC_SUPPORT')
-    } else {
-      throw makeError('No WebRTC support: Not a supported browser', 'ERR_WEBRTC_SUPPORT')
-    }
-  }
-
-  self._pcReady = false
-  self._channelReady = false
-  self._iceComplete = false // ice candidate trickle done (got null candidate)
-  self._iceCompleteTimer = null // send an offer/answer anyway after some timeout
-  self._channel = null
-  self._pendingCandidates = []
-
-  self._isNegotiating = !self.initiator // is this peer waiting for negotiation to complete?
-  self._batchedNegotiation = false // batch synchronous negotiations
-  self._queuedNegotiation = false // is there a queued negotiation request?
-  self._sendersAwaitingStable = []
-  self._senderMap = new Map()
-  self._firstStable = true
-  self._closingInterval = null
-
-  self._remoteTracks = []
-  self._remoteStreams = []
-
-  self._chunk = null
-  self._cb = null
-  self._interval = null
-
-  try {
-    self._pc = new (self._wrtc.RTCPeerConnection)(self.config)
-  } catch (err) {
-    setTimeout(() => self.destroy(makeError(err, 'ERR_PC_CONSTRUCTOR')), 0)
-    return
-  }
-
-  // We prefer feature detection whenever possible, but sometimes that's not
-  // possible for certain implementations.
-  self._isReactNativeWebrtc = typeof self._pc._peerConnectionId === 'number'
-
-  self._pc.oniceconnectionstatechange = function () {
-    self._onIceStateChange()
-  }
-  self._pc.onicegatheringstatechange = function () {
-    self._onIceStateChange()
-  }
-  self._pc.onsignalingstatechange = function () {
-    self._onSignalingStateChange()
-  }
-  self._pc.onicecandidate = function (event) {
-    self._onIceCandidate(event)
-  }
-
-  // Other spec events, unused by this implementation:
-  // - onconnectionstatechange
-  // - onicecandidateerror
-  // - onfingerprintfailure
-  // - onnegotiationneeded
-
-  if (self.initiator) {
-    self._setupData({
-      channel: self._pc.createDataChannel(self.channelName, self.channelConfig)
-    })
-  } else {
-    self._pc.ondatachannel = function (event) {
-      self._setupData(event)
-    }
-  }
-
-  if (self.streams) {
-    self.streams.forEach(function (stream) {
-      self.addStream(stream)
-    })
-  }
-  self._pc.ontrack = function (event) {
-    self._onTrack(event)
-  }
-
-  if (self.initiator) {
-    self._needsNegotiation()
-  }
-
-  self._onFinishBound = function () {
-    self._onFinish()
-  }
-  self.once('finish', self._onFinishBound)
-}
-
-Emittery.mixin('emittery')(SimplerPeer);
 
 SimplerPeer.WEBRTC_SUPPORT = !!getBrowserRTC()
 
@@ -1044,3 +1037,5 @@ function makeError (message, code) {
 function warn (message) {
   console.warn(message)
 }
+
+module.exports = SimplerPeer
